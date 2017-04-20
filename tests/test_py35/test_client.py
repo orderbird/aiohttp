@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 
 import aiohttp
@@ -68,3 +69,60 @@ async def test_close_detached_session_on_non_existing_addr(loop):
     with pytest.raises(Exception):
         await cm
     assert session.closed
+
+
+async def test_aiohttp_request(loop, test_server):
+    async def handler(request):
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_get('/', handler)
+    server = await test_server(app)
+
+    async with aiohttp.request('GET', server.make_url('/'), loop=loop) as resp:
+        await resp.read()
+        assert resp.status == 200
+
+    resp = await aiohttp.request('GET', server.make_url('/'), loop=loop)
+    await resp.read()
+    assert resp.status == 200
+    assert resp.connection is None
+
+
+@pytest.mark.parametrize("semaphore_value, conn_limit", [
+    # (100, 200),
+    # (200, 200),
+    # (100, 100),
+    # (200, 100),
+    # (100, 0),
+    # (200, 0),
+    (100, None),
+    (200, None)
+])
+async def test_no_timeout_using_semaphore(loop, test_server, semaphore_value, conn_limit):
+
+    async def handler(request):
+        resp = web.Response()
+        await asyncio.sleep(0.05, loop=loop)
+        return resp
+
+    async def read_resp(session, server, semaphore):
+        async with semaphore:
+            resp = await session.get(server.make_url('/'), timeout=0.1)
+            await resp.read()
+
+    app = web.Application(loop=loop)
+    app.router.add_route('GET', '/', handler)
+    server = await test_server(app)
+
+    rows = []
+    semaphore = asyncio.Semaphore(semaphore_value, loop=loop)
+    conn_kwargs = dict(loop=loop)
+    if conn_limit:
+        conn_kwargs['limit'] = conn_limit
+    connector = aiohttp.TCPConnector(**conn_kwargs)
+    async with aiohttp.ClientSession(connector=connector, loop=loop) as session:
+        for i in range(int(semaphore_value*5)):
+            rows.append(asyncio.ensure_future(read_resp(session, server, semaphore),
+                                              loop=loop))
+        await asyncio.gather(*rows)
